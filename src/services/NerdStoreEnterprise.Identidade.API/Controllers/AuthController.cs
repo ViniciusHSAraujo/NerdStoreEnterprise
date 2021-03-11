@@ -15,7 +15,7 @@ using System.Threading.Tasks;
 namespace NerdStoreEnterprise.Identidade.API.Controllers
 {
     [Route("api/identidade")]
-    public class AuthController : Controller
+    public class AuthController : MainController
     {
 
         private readonly SignInManager<IdentityUser> _signInManager;
@@ -32,7 +32,7 @@ namespace NerdStoreEnterprise.Identidade.API.Controllers
         [HttpPost("nova-conta")]
         public async Task<ActionResult> Registrar([FromBody] UsuarioRegistro usuarioRegistro)
         {
-            if (!ModelState.IsValid) return BadRequest();
+            if (!ModelState.IsValid) return CustomResponse(ModelState);
 
             var user = new IdentityUser
             {
@@ -45,32 +45,82 @@ namespace NerdStoreEnterprise.Identidade.API.Controllers
 
             if (result.Succeeded)
             {
-                await _signInManager.SignInAsync(user, false);
-                return Ok(await GerarJwt(usuarioRegistro.Email));
+                return CustomResponse(await GerarJwt(usuarioRegistro.Email));
             }
 
-            return BadRequest();
+            foreach (var error in result.Errors)
+            {
+                AdicionarErroProcessamento(error.Description);
+            }
+
+            return CustomResponse();
         }
 
         [HttpPost("autenticar")]
         public async Task<ActionResult> Login([FromBody] UsuarioLogin usuarioLogin)
         {
-            if (!ModelState.IsValid) return BadRequest();
+            if (!ModelState.IsValid) return CustomResponse(ModelState);
 
             var result = await _signInManager.PasswordSignInAsync(usuarioLogin.Email, usuarioLogin.Senha, false, true);
 
             if (result.Succeeded)
             {
-                return Ok(await GerarJwt(usuarioLogin.Email));
+                return CustomResponse(await GerarJwt(usuarioLogin.Email));
             }
 
-            return BadRequest();
+            if (result.IsLockedOut)
+            {
+                AdicionarErroProcessamento("Usuário temporariamente bloqueado por tentativas inválidas.");
+                return CustomResponse();
+            }
+
+            AdicionarErroProcessamento("Usuário ou senha incorretos.");
+            return CustomResponse();
         }
 
         private async Task<UsuarioRespostaLogin> GerarJwt(string email)
         {
             var user = await _userManager.FindByEmailAsync(email);
             var claims = await _userManager.GetClaimsAsync(user);
+            var identityClaims = await ObterClaimsUsuario(user, claims);
+            var encodedToken = CodificarToken(identityClaims);
+            return ObterRespostaToken(user, claims, encodedToken);
+        }
+
+        private UsuarioRespostaLogin ObterRespostaToken(IdentityUser user, IList<Claim> claims, string encodedToken)
+        {
+            return new UsuarioRespostaLogin
+            {
+                AccessToken = encodedToken,
+                ExpiresIn = TimeSpan.FromHours(_jwtSettings.ExpiracaoHoras).TotalSeconds,
+                UsuarioToken = new UsuarioToken
+                {
+                    Id = user.Id,
+                    Email = user.Email,
+                    Claims = claims.Select(c => new UsuarioClaim { Type = c.Type, Value = c.Value })
+                }
+            };
+        }
+
+        private string CodificarToken(ClaimsIdentity identityClaims)
+        {
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var key = Encoding.ASCII.GetBytes(_jwtSettings.Secret);
+
+            var token = tokenHandler.CreateToken(new SecurityTokenDescriptor
+            {
+                Issuer = _jwtSettings.Emissor,
+                Audience = _jwtSettings.ValidoEm,
+                Subject = identityClaims,
+                Expires = DateTime.UtcNow.AddHours(_jwtSettings.ExpiracaoHoras),
+                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+            });
+
+            return tokenHandler.WriteToken(token);
+        }
+
+        private async Task<ClaimsIdentity> ObterClaimsUsuario(IdentityUser user, IList<Claim> claims)
+        {
             var userRoles = await _userManager.GetRolesAsync(user);
 
             claims.Add(new Claim(JwtRegisteredClaimNames.Sub, user.Id));
@@ -86,34 +136,7 @@ namespace NerdStoreEnterprise.Identidade.API.Controllers
 
             var identityClaims = new ClaimsIdentity();
             identityClaims.AddClaims(claims);
-
-            var tokenHandler = new JwtSecurityTokenHandler();
-            var key = Encoding.ASCII.GetBytes(_jwtSettings.Secret);
-
-            var token = tokenHandler.CreateToken(new SecurityTokenDescriptor
-            {
-                Issuer = _jwtSettings.Emissor,
-                Audience = _jwtSettings.ValidoEm,
-                Subject = identityClaims,
-                Expires = DateTime.UtcNow.AddHours(_jwtSettings.ExpiracaoHoras),
-                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
-            });
-
-            var encodedToken = tokenHandler.WriteToken(token);
-
-            var response = new UsuarioRespostaLogin
-            {
-                AccessToken = encodedToken,
-                ExpiresIn = TimeSpan.FromHours(_jwtSettings.ExpiracaoHoras).TotalSeconds,
-                UsuarioToken = new UsuarioToken
-                {
-                    Id = user.Id,
-                    Email = user.Email,
-                    Claims = claims.Select(c => new UsuarioClaim { Type = c.Type, Value = c.Value })
-                }
-            };
-
-            return response;
+            return identityClaims;
         }
 
         private static long ToUnixEpochDate(DateTime date)
